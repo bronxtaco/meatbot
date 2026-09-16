@@ -37,9 +37,12 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from dotenv import load_dotenv
 
 import discord
 from discord.ext import commands
+
+load_dotenv()
 
 # --------------------------------------------------------------------------- #
 # Config
