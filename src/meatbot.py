@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import random
 import re
@@ -1659,6 +1660,234 @@ async def stopfightclub(ctx: commands.Context):
     fight_clubs.pop(ctx.channel.id, None)
     await ctx.send("🥊 **Fight club is over.**")
     await ctx.send(embed=build_leaderboard_embed(club, final=True))
+
+
+# --------------------------------------------------------------------------- #
+# Custom embeds (server owner only)
+# --------------------------------------------------------------------------- #
+
+EMBED_KEYS = (
+    "title", "url", "description", "desc", "color", "colour", "image",
+    "thumbnail", "author", "author_url", "author_icon", "footer",
+    "footer_icon", "timestamp", "field", "inline",
+)
+# Only these words count as keys at the start of a line, so a URL or a sentence
+# containing a colon isn't mistaken for one.
+EMBED_KEY_RE = re.compile(rf"^({'|'.join(EMBED_KEYS)})\s*:\s*(.*)$", re.IGNORECASE)
+CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```$", re.DOTALL)
+
+# Discord's own limits. Hitting these server-side gives an opaque 400, so check
+# them here and say which field is the problem.
+EMBED_LIMITS = {
+    "title": 256, "description": 4096, "footer": 2048, "author": 256,
+    "field name": 256, "field value": 1024,
+}
+
+
+def parse_colour(raw: str) -> discord.Colour | None:
+    """Accept #ff0000, 0xff0000, ff0000, or a discord.Colour name like 'blurple'."""
+    raw = raw.strip()
+    hex_part = raw.lstrip("#")
+    if hex_part.lower().startswith("0x"):
+        hex_part = hex_part[2:]
+    with contextlib.suppress(ValueError):
+        value = int(hex_part, 16)
+        if 0 <= value <= 0xFFFFFF:
+            return discord.Colour(value)
+    factory = getattr(discord.Colour, raw.lower().replace(" ", "_"), None)
+    if callable(factory):
+        with contextlib.suppress(TypeError):
+            result = factory()
+            if isinstance(result, discord.Colour):
+                return result
+    return None
+
+
+def parse_embed_spec(text: str) -> tuple[discord.Embed | None, str | None]:
+    """Turn a spec into an Embed. Returns (embed, error message)."""
+    text = text.strip()
+    fence = CODE_FENCE_RE.match(text)
+    if fence:
+        text = fence.group(1).strip()
+
+    # JSON mode: the same shape Discord's API uses, so anything the key:value
+    # form can't express can still be built by hand.
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return None, f"That isn't valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        if not isinstance(data, dict):
+            return None, "JSON has to be an object, not a list or a bare value."
+        if isinstance(data.get("color"), str):
+            colour = parse_colour(data["color"])
+            if colour is None:
+                return None, f"Didn't recognise the colour `{data['color']}`."
+            data["color"] = colour.value
+        try:
+            return discord.Embed.from_dict(data), None
+        except Exception as exc:  # malformed nested structures
+            return None, f"Couldn't build an embed from that: {exc}"
+
+    # key: value mode. Lines that don't start with a known key continue the
+    # previous value, so descriptions can run over several lines naturally.
+    pairs: list[list[str]] = []
+    for line in text.splitlines():
+        match = EMBED_KEY_RE.match(line)
+        if match:
+            pairs.append([match.group(1).lower(), match.group(2)])
+        elif pairs:
+            pairs[-1][1] += "\n" + line
+        elif line.strip():
+            pairs.append(["description", line])
+
+    if not pairs:
+        return None, "Nothing to build an embed from."
+
+    embed = discord.Embed()
+    author_name = author_url = author_icon = None
+    footer_text = footer_icon = None
+
+    for key, value in pairs:
+        value = value.strip()
+        if not value:
+            continue
+        if key == "title":
+            embed.title = value
+        elif key == "url":
+            embed.url = value
+        elif key in ("description", "desc"):
+            embed.description = value if not embed.description else f"{embed.description}\n{value}"
+        elif key in ("color", "colour"):
+            colour = parse_colour(value)
+            if colour is None:
+                return None, (
+                    f"Didn't recognise the colour `{value}` — try a hex code "
+                    f"like `#5865F2` or a name like `blurple`."
+                )
+            embed.colour = colour
+        elif key == "image":
+            embed.set_image(url=value)
+        elif key == "thumbnail":
+            embed.set_thumbnail(url=value)
+        elif key == "author":
+            author_name = value
+        elif key == "author_url":
+            author_url = value
+        elif key == "author_icon":
+            author_icon = value
+        elif key == "footer":
+            footer_text = value
+        elif key == "footer_icon":
+            footer_icon = value
+        elif key == "timestamp":
+            if value.lower() == "now":
+                embed.timestamp = datetime.now(timezone.utc)
+            else:
+                try:
+                    embed.timestamp = datetime.fromisoformat(value)
+                except ValueError:
+                    return None, f"Couldn't read `{value}` as a date — try `now` or `2026-09-17T14:00`."
+        elif key in ("field", "inline"):
+            name, _, field_value = value.partition("|")
+            if not field_value.strip():
+                return None, f"Fields need a `|` between name and value: `{key}: Name | Value`"
+            if len(embed.fields) >= 25:
+                return None, "An embed can hold at most 25 fields."
+            embed.add_field(
+                name=name.strip(), value=field_value.strip(), inline=(key == "inline")
+            )
+
+    if author_name:
+        embed.set_author(
+            name=author_name, url=author_url or None, icon_url=author_icon or None
+        )
+    if footer_text:
+        embed.set_footer(text=footer_text, icon_url=footer_icon or None)
+    return embed, None
+
+
+def check_embed_limits(embed: discord.Embed) -> str | None:
+    checks = [
+        ("title", embed.title), ("description", embed.description),
+        ("footer", embed.footer.text), ("author", embed.author.name),
+    ]
+    for label, content in checks:
+        if content and len(content) > EMBED_LIMITS[label]:
+            return f"The {label} is {len(content)} characters — the limit is {EMBED_LIMITS[label]}."
+    for f in embed.fields:
+        if f.name and len(f.name) > EMBED_LIMITS["field name"]:
+            return f"A field name is too long (limit {EMBED_LIMITS['field name']})."
+        if f.value and len(f.value) > EMBED_LIMITS["field value"]:
+            return f"A field value is too long (limit {EMBED_LIMITS['field value']})."
+    if len(embed) > 6000:
+        return f"The whole embed is {len(embed)} characters — Discord's total limit is 6000."
+    return None
+
+
+EMBED_USAGE = f"""\
+**`{COMMAND_PREFIX}embed`** — post a custom embed here.
+
+```
+{COMMAND_PREFIX}embed
+title: Weekly race night
+color: #5865F2
+description: Sign-ups open now.
+Markdown works: **bold**, *italics*, [links](https://example.com)
+image: https://example.com/banner.png
+thumbnail: https://example.com/icon.png
+author: meatbot
+footer: see you Friday
+timestamp: now
+field: When | Friday 8pm
+inline: Where | #casual-lobby
+```
+
+Keys: `title` `url` `description` `color` `image` `thumbnail` `author` \
+`author_url` `author_icon` `footer` `footer_icon` `timestamp` `field` `inline`
+
+`field`/`inline` take `Name | Value`. Colours take a hex code or a name \
+(`red`, `blurple`, `gold`). Lines that don't start with a key continue the \
+line above, so descriptions can span several lines. Attach an image to the \
+message and it's used automatically if you didn't set one.
+
+You can also paste raw JSON in Discord's embed format instead."""
+
+
+@bot.command(name="embed", hidden=True)
+@commands.guild_only()
+async def embed_command(ctx: commands.Context, *, spec: str | None = None):
+    if not is_server_owner(ctx):
+        return
+    if not spec:
+        await ctx.send(EMBED_USAGE)
+        return
+
+    embed, error = parse_embed_spec(spec)
+    if embed is None:
+        await nope(ctx, f"⚠️ {error}")
+        return
+
+    # An attached image is the easy path: no need to host it somewhere first.
+    if not embed.image.url and ctx.message.attachments:
+        first = ctx.message.attachments[0]
+        if (first.content_type or "").startswith("image/"):
+            embed.set_image(url=first.url)
+
+    problem = check_embed_limits(embed)
+    if problem:
+        await nope(ctx, f"⚠️ {problem}")
+        return
+
+    try:
+        await ctx.send(embed=embed)
+    except discord.HTTPException as exc:
+        await nope(ctx, f"⚠️ Discord rejected it: {exc.text or exc}")
+        return
+
+    # Leave just the embed behind.
+    with contextlib.suppress(discord.HTTPException):
+        await ctx.message.delete()
 
 
 # --------------------------------------------------------------------------- #
